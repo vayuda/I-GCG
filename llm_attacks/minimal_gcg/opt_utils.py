@@ -12,7 +12,7 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
 
     """
     Computes gradients of the loss with respect to the coordinates.
-    
+
     Parameters
     ----------
     model : Transformer Model
@@ -40,51 +40,51 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
         dtype=embed_weights.dtype
     )
     one_hot.scatter_(
-        1, 
+        1,
         input_ids[input_slice].unsqueeze(1),
         torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
     )
     one_hot.requires_grad_()
     input_embeds = (one_hot @ embed_weights).unsqueeze(0)
-    
+
     # now stitch it together with the rest of the embeddings
     embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
     full_embeds = torch.cat(
         [
-            embeds[:,:input_slice.start,:], 
-            input_embeds, 
+            embeds[:,:input_slice.start,:],
+            input_embeds,
             embeds[:,input_slice.stop:,:]
-        ], 
+        ],
         dim=1)
-    
+
     logits = model(inputs_embeds=full_embeds).logits
     targets = input_ids[target_slice]
     loss = nn.CrossEntropyLoss()(logits[0,loss_slice,:], targets)
-    
+
     loss.backward()
-    
+
     grad = one_hot.grad.clone()
     grad = grad / grad.norm(dim=-1, keepdim=True)
-    
+
     return grad
 
 def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
 
     if not_allowed_tokens is not None:
-        grad[:, not_allowed_tokens.to(grad.device)] = np.infty
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
 
     top_indices = (-grad).topk(topk, dim=1).indices
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
     new_token_pos = torch.arange(
-        0, 
-        len(control_toks), 
+        0,
+        len(control_toks),
         len(control_toks) / batch_size,
         device=grad.device
     ).type(torch.int64)
     new_token_val = torch.gather(
-        top_indices[new_token_pos], 1, 
+        top_indices[new_token_pos], 1,
         torch.randint(0, topk, (batch_size, 1),
         device=grad.device)
     )
@@ -112,7 +112,7 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
 
 
 def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None, return_ids=False, batch_size=512):
-    
+
     if isinstance(test_controls[0], str):
         max_len = control_slice.stop - control_slice.start
         test_ids = [
@@ -130,7 +130,7 @@ def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None
     if not(test_ids[0].shape[0] == control_slice.stop - control_slice.start):
         raise ValueError((
             f"test_controls must have shape "
-            f"(n, {control_slice.stop - control_slice.start}), " 
+            f"(n, {control_slice.stop - control_slice.start}), "
             f"got {test_ids.shape}"
         ))
 
@@ -154,13 +154,13 @@ def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None
         logits = forward(model=model, input_ids=ids, attention_mask=attn_mask, batch_size=batch_size)
         del ids ; gc.collect()
         return logits
-    
+
 
 def forward(*, model, input_ids, attention_mask, batch_size=512):
 
     logits = []
     for i in range(0, input_ids.shape[0], batch_size):
-        
+
         batch_input_ids = input_ids[i:i+batch_size]
         if attention_mask is not None:
             batch_attention_mask = attention_mask[i:i+batch_size]
@@ -172,7 +172,7 @@ def forward(*, model, input_ids, attention_mask, batch_size=512):
         gc.collect()
 
     del batch_input_ids, batch_attention_mask
-    
+
     return torch.cat(logits, dim=0)
 
 def target_loss(logits, ids, target_slice):
@@ -189,15 +189,15 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
             trust_remote_code=True,
             **kwargs
         ).to(device).eval()
-    
+
     tokenizer_path = model_path if tokenizer_path is None else tokenizer_path
-    
+
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         trust_remote_code=True,
         use_fast=False
     )
-    
+
     if 'oasst-sft-6-llama-30b' in tokenizer_path:
         tokenizer.bos_token_id = 1
         tokenizer.unk_token_id = 0
@@ -211,5 +211,5 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
         tokenizer.padding_side = 'left'
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     return model, tokenizer

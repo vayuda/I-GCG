@@ -32,7 +32,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
 
 import gc
-import openai
+# import openai
 import time
 import numpy as np
 import torch
@@ -134,10 +134,7 @@ suffix_manager = SuffixManager(tokenizer=tokenizer,
 def generate(model, tokenizer, input_ids, assistant_role_slice, gen_config=None):
     if gen_config is None:
         gen_config = model.generation_config
-        gen_config.max_new_tokens = 32
-
-    if gen_config.max_new_tokens > 50:
-        print('WARNING: max_new_tokens > 32 may cause testing to slow down.')
+        gen_config.max_new_tokens = 128
 
     input_ids = input_ids[:assistant_role_slice.stop].to(model.device).unsqueeze(0)
     attn_masks = torch.ones_like(input_ids).to(model.device)
@@ -155,6 +152,8 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
                                         assistant_role_slice,
                                         gen_config=gen_config)).strip()
     jailbroken = not any([prefix in gen_str for prefix in test_prefixes])
+    if jailbroken:
+        print(f"Jailbroken! Generated text: {gen_str}")
     return jailbroken,gen_str
 
 
@@ -168,8 +167,12 @@ current_tcs = []
 temp = 0
 v2_success_counter = 0
 previous_update_k_loss=100
-for i in range(num_steps):
+from tqdm import tqdm
+loss_history = []
+patience = 100  # Number of steps to look back
+min_improvement = 0.01  # Minimum relative improvement
 
+for i in tqdm(range(num_steps)):
     # Step 1. Encode user prompt (behavior + adv suffix) as tokens and return token ids.
     input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix)
     input_ids = input_ids.to(device)
@@ -224,7 +227,7 @@ for i in range(num_steps):
 
         current_loss = 0
         # best_new_adv_suffix=adv_suffix
-        print('adv_suffix', adv_suffix)
+        # print('adv_suffix', adv_suffix)
 
         ori_adv_suffix_ids = tokenizer(adv_suffix, add_special_tokens=False).input_ids
         adv_suffix_ids = tokenizer(adv_suffix, add_special_tokens=False).input_ids
@@ -236,7 +239,7 @@ for i in range(num_steps):
 
             # current_loss = losses[idx] + current_loss
 
-            print('temp_new_adv_suffix', temp_new_adv_suffix)
+            # print('temp_new_adv_suffix', temp_new_adv_suffix)
             temp_new_adv_suffix_ids = tokenizer(temp_new_adv_suffix, add_special_tokens=False).input_ids
 
             # print((adv_suffix_ids))
@@ -271,7 +274,7 @@ for i in range(num_steps):
         # print("current_update_k_loss",current_update_k_loss)
         #
         # print('best_new_adv_suffix',best_new_adv_suffix)
-        print('all_new_adv_suffix',all_new_adv_suffix)
+        # print('all_new_adv_suffix',all_new_adv_suffix)
 
         new_logits, new_ids = get_logits(model=model,
                                      tokenizer=tokenizer,
@@ -283,14 +286,14 @@ for i in range(num_steps):
 
         losses = target_loss(new_logits, new_ids, suffix_manager._target_slice)
 
-        print(losses)
+        # print(losses)
         best_new_adv_suffix_id = losses.argmin()
         best_new_adv_suffix = all_new_adv_suffix[best_new_adv_suffix_id]
 
         current_loss = losses[best_new_adv_suffix_id]
-        print("current_loss",current_loss)
+        # print("current_loss",current_loss)
             # Update the running adv_suffix with the best candidate
-        print("best_new_adv_suffix",best_new_adv_suffix)
+        # print("best_new_adv_suffix",best_new_adv_suffix)
         adv_suffix = best_new_adv_suffix
 
 
@@ -343,8 +346,17 @@ for i in range(num_steps):
         }
         log_dict.append(log_entry)
 
-        # if current_loss.detach().cpu().numpy()<0.05:
-        #     break
+        loss_history.append(current_loss.detach().cpu().item())
+        if i > patience:
+            # Calculate relative improvement over last patience steps
+            older_loss = loss_history[-patience]
+            current_loss_val = loss_history[-1]
+            relative_improvement = (older_loss - current_loss_val) / older_loss
+            print(f"Relative improvement over last {patience} iters: {relative_improvement:.4f}")
+
+            if relative_improvement < min_improvement:
+                print(f"Early stopping at step {i}: Insufficient improvement in last {patience} steps")
+                break
         del coordinate_grad, adv_suffix_tokens;
         gc.collect()
         torch.cuda.empty_cache()
