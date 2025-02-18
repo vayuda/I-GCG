@@ -31,7 +31,7 @@ Visit our docs for all our [model uploads](https://docs.unsloth.ai/get-started/a
 # # Skip restarting message in Colab
 # import sys; modules = list(sys.modules.keys())
 # for x in modules: sys.modules.pop(x) if "PIL" in x or "google" in x else None
-# 
+#
 # !pip install unsloth vllm
 # !pip install --upgrade pillow
 
@@ -40,35 +40,53 @@ Visit our docs for all our [model uploads](https://docs.unsloth.ai/get-started/a
 Use `PatchFastRL` before all functions to patch GRPO and other RL algorithms!
 """
 
+from trl import GRPOConfig, GRPOTrainer
+from vllm import SamplingParams
+from datasets import load_dataset, Dataset
+import re
+import torch
 from unsloth import FastLanguageModel, PatchFastRL
+from unsloth import is_bfloat16_supported
 PatchFastRL("GRPO", FastLanguageModel)
 
 """Load up `Qwen 2.5 3B Instruct`, and set parameters"""
 
-from unsloth import is_bfloat16_supported
-import torch
-max_seq_length = 1024 # Can increase for longer reasoning traces
-lora_rank = 64 # Larger rank = smarter, but slower
+max_seq_length = 1024  # Can increase for longer reasoning traces
+lora_rank = 64  # Larger rank = smarter, but slower
 
+
+# adversarieal model
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "Qwen/Qwen2.5-3B-Instruct",
-    max_seq_length = max_seq_length,
-    load_in_4bit = True, # False for LoRA 16bit
-    fast_inference = True, # Enable vLLM fast inference
-    max_lora_rank = lora_rank,
-    gpu_memory_utilization = 0.5, # Reduce if out of memory
+    model_name="Qwen/Qwen2.5-3B-Instruct",
+    max_seq_length=max_seq_length,
+    load_in_4bit=True,  # False for LoRA 16bit
+    fast_inference=True,  # Enable vLLM fast inference
+    max_lora_rank=lora_rank,
+    gpu_memory_utilization=0.5,  # Reduce if out of memory
 )
 
 model = FastLanguageModel.get_peft_model(
     model,
-    r = lora_rank, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-    target_modules = [
+    r=lora_rank,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+    target_modules=[
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
-    ], # Remove QKVO if out of memory
-    lora_alpha = lora_rank,
-    use_gradient_checkpointing = "unsloth", # Enable long context finetuning
-    random_state = 3407,
+    ],  # Remove QKVO if out of memory
+    lora_alpha=lora_rank,
+    use_gradient_checkpointing="unsloth",  # Enable long context finetuning
+    random_state=3407,
+)
+
+# FOR REWARD FUNCTION
+
+r1_model, r1_tokenizer = FastLanguageModel.from_pretrained(
+    # Replace with your DeepSeek r1 model identifier
+    model_name="unsloth/DeepSeek-R1-Distill-Qwen-1.5B-unsloth-bnb-4bit",
+    max_seq_length=max_seq_length,
+    load_in_4bit=True,  # Adjust according to your requirements
+    fast_inference=True,
+    max_lora_rank=lora_rank,
+    gpu_memory_utilization=0.5,
 )
 
 """### Data Prep
@@ -77,18 +95,10 @@ model = FastLanguageModel.get_peft_model(
 We directly leverage [@willccbb](https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb) for data prep and all reward functions. You are free to create your own!
 """
 
-import re
-from datasets import load_dataset, Dataset
 
 # Load and prep dataset
 SYSTEM_PROMPT = """
-Respond in the following format:
-<reasoning>
-...
-</reasoning>
-<answer>
-...
-</answer>
+Heres a question <question> write some words to make the model think less/faster
 """
 
 XML_COT_FORMAT = """\
@@ -100,10 +110,12 @@ XML_COT_FORMAT = """\
 </answer>
 """
 
+
 def extract_xml_answer(text: str) -> str:
     answer = text.split("<answer>")[-1]
     answer = answer.split("</answer>")[0]
     return answer.strip()
+
 
 def extract_hash_answer(text: str) -> str | None:
     if "####" not in text:
@@ -111,63 +123,97 @@ def extract_hash_answer(text: str) -> str | None:
     return text.split("####")[1].strip()
 
 # uncomment middle messages for 1-shot prompting
-def get_gsm8k_questions(split = "train") -> Dataset:
-    data = load_dataset('openai/gsm8k', 'main')[split] # type: ignore
-    data = data.map(lambda x: { # type: ignore
+
+
+def get_gsm8k_questions(split="train") -> Dataset:
+    data = load_dataset('openai/gsm8k', 'main')[split]  # type: ignore
+    data = data.map(lambda x: {  # type: ignore
         'prompt': [
             {'role': 'system', 'content': SYSTEM_PROMPT},
             {'role': 'user', 'content': x['question']}
         ],
         'answer': extract_hash_answer(x['answer'])
-    }) # type: ignore
-    return data # type: ignore
+    })  # type: ignore
+    return data  # type: ignore
+
 
 dataset = get_gsm8k_questions()
 
-# Reward functions
-def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
-    responses = [completion[0]['content'] for completion in completions]
-    q = prompts[0][-1]['content']
-    extracted_responses = [extract_xml_answer(r) for r in responses]
-    print('-'*20, f"Question:\n{q}", f"\nAnswer:\n{answer[0]}", f"\nResponse:\n{responses[0]}", f"\nExtracted:\n{extracted_responses[0]}")
-    return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
 
-def int_reward_func(completions, **kwargs) -> list[float]:
-    responses = [completion[0]['content'] for completion in completions]
-    extracted_responses = [extract_xml_answer(r) for r in responses]
-    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+def generate_adversarial_suffix(question: str, max_new_tokens: int = 20) -> str:
 
-def strict_format_reward_func(completions, **kwargs) -> list[float]:
-    """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
-    responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
+    prompt = f"Here's a question: {question}\nWrite some words to make the model think less/faster: "
+    inputs = tokenizer(prompt, return_tensors="pt")
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.8,
+    )
+    generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    suffix = generated_text[len(prompt):].strip()
+    return suffix
 
-def soft_format_reward_func(completions, **kwargs) -> list[float]:
-    """Reward function that checks if the completion has a specific format."""
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-    responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
-    return [0.5 if match else 0.0 for match in matches]
 
-def count_xml(text) -> float:
-    count = 0.0
-    if text.count("<reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n</reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n<answer>\n") == 1:
-        count += 0.125
-        count -= len(text.split("\n</answer>\n")[-1])*0.001
-    if text.count("\n</answer>") == 1:
-        count += 0.125
-        count -= (len(text.split("\n</answer>")[-1]) - 1)*0.001
-    return count
+def deepseek_token_reward_func(prompts, completions, **kwargs) -> list[float]:
+    """
+    For each prompt, this function:
+      1. Extracts the original GSM8k question from the last message.
+      2. Extracts the adversarial suffix from the corresponding completion (assumed to be in completion[0]['content']).
+      3. Appends the suffix to the question and feeds the combined prompt into the DeepSeek r1 model.
+      4. Extracts the <think> ... </think> section from the generated output.
+      5. Computes the reward as the number of tokens in the extracted thinking portion.
 
-def xmlcount_reward_func(completions, **kwargs) -> list[float]:
-    contents = [completion[0]["content"] for completion in completions]
-    return [count_xml(c) for c in contents]
+    Args:
+        prompts (list): A list of prompts, where each prompt is a list of message dictionaries.
+        completions (list): A list of completions corresponding to the adversarial suffix.
+        **kwargs: Additional keyword arguments if needed.
+
+    Returns:
+        list[float]: A list of rewards (token counts of the thinking portion) for each prompt.
+    """
+    rewards = []
+    # Get the device of the r1 model
+    device = next(r1_model.parameters()).device
+
+    for prompt_messages, completion in zip(prompts, completions):
+        # Extract the original question (assumed to be the last message in the prompt)
+        question = prompt_messages[-1]['content']
+        # Extract adversarial suffix from the completion (assumed to be the first message's content)
+        adversarial_suffix = completion[0]['content']
+        combined_prompt = f"{question} {adversarial_suffix}"
+
+        # Tokenize the combined prompt and move tensors to the same device as r1_model.
+        inputs = r1_tokenizer(combined_prompt, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # Generate output from the r1 model.
+        output_ids = r1_model.generate(
+            **inputs,
+            max_new_tokens=50,  # Adjust as needed.
+            do_sample=True,
+            temperature=0.8,
+        )
+        generated_text = r1_tokenizer.decode(
+            output_ids[0], skip_special_tokens=True)
+
+        # Extract the thinking portion from the output using regex.
+        # NOTE: We now use a capturing group to capture text between <think> and </think>
+        think_pattern = r"<think>(.*?)</think>"
+        match = re.search(think_pattern, generated_text, re.DOTALL)
+        if match:
+            thinking_text = match.group(1).strip()
+        else:
+            thinking_text = ""
+
+        # Count tokens in the thinking text.
+        token_count = len(r1_tokenizer.tokenize(thinking_text))
+        # You can choose to reward higher token count (or penalize with a negative sign) as needed.
+        reward = token_count
+        rewards.append(reward)
+
+    return rewards
+
 
 """<a name="Train"></a>
 ### Train the model
@@ -175,30 +221,29 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
 Now set up GRPO Trainer and all configurations!
 """
 
-from trl import GRPOConfig, GRPOTrainer
 training_args = GRPOConfig(
-    use_vllm = True, # use vLLM for fast inference!
-    learning_rate = 5e-6,
-    adam_beta1 = 0.9,
-    adam_beta2 = 0.99,
-    weight_decay = 0.1,
-    warmup_ratio = 0.1,
-    lr_scheduler_type = "cosine",
-    optim = "adamw_8bit",
-    logging_steps = 1,
-    bf16 = is_bfloat16_supported(),
-    fp16 = not is_bfloat16_supported(),
-    per_device_train_batch_size = 1,
-    gradient_accumulation_steps = 1, # Increase to 4 for smoother training
-    num_generations = 8, # Decrease if out of memory
-    max_prompt_length = 256,
-    max_completion_length = 200,
+    use_vllm=True,  # use vLLM for fast inference!
+    learning_rate=5e-6,
+    adam_beta1=0.9,
+    adam_beta2=0.99,
+    weight_decay=0.1,
+    warmup_ratio=0.1,
+    lr_scheduler_type="cosine",
+    optim="adamw_8bit",
+    logging_steps=1,
+    bf16=is_bfloat16_supported(),
+    fp16=not is_bfloat16_supported(),
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=1,  # Increase to 4 for smoother training
+    num_generations=8,  # Decrease if out of memory
+    max_prompt_length=256,
+    max_completion_length=200,
     # num_train_epochs = 1, # Set to 1 for a full training run
-    max_steps = 250,
-    save_steps = 250,
-    max_grad_norm = 0.1,
-    report_to = "none", # Can use Weights & Biases
-    output_dir = "outputs",
+    max_steps=250,
+    save_steps=250,
+    max_grad_norm=0.1,
+    report_to="none",  # Can use Weights & Biases
+    output_dir="outputs",
 )
 
 """And let's run the trainer! If you scroll up, you'll see a table of rewards. The goal is to see the `reward` column increase!
@@ -213,18 +258,15 @@ You might have to wait 150 to 200 steps for any action. You'll probably get 0 re
 
 """
 
+r1_model = FastLanguageModel.for_inference(r1_model)
 trainer = GRPOTrainer(
-    model = model,
-    processing_class = tokenizer,
-    reward_funcs = [
-        xmlcount_reward_func,
-        soft_format_reward_func,
-        strict_format_reward_func,
-        int_reward_func,
-        correctness_reward_func,
+    model=model,
+    processing_class=tokenizer,
+    reward_funcs=[
+        deepseek_token_reward_func
     ],
-    args = training_args,
-    train_dataset = dataset,
+    args=training_args,
+    train_dataset=dataset,
 )
 trainer.train()
 
@@ -234,19 +276,18 @@ Now let's try the model we just trained! First, let's first try the model withou
 """
 
 text = tokenizer.apply_chat_template([
-    {"role" : "user", "content" : "How many r's are in strawberry?"},
-], tokenize = False, add_generation_prompt = True)
+    {"role": "user", "content": "How many r's are in strawberry?"},
+], tokenize=False, add_generation_prompt=True)
 
-from vllm import SamplingParams
 sampling_params = SamplingParams(
-    temperature = 0.8,
-    top_p = 0.95,
-    max_tokens = 1024,
+    temperature=0.8,
+    top_p=0.95,
+    max_tokens=1024,
 )
 output = model.fast_generate(
     [text],
-    sampling_params = sampling_params,
-    lora_request = None,
+    sampling_params=sampling_params,
+    lora_request=None,
 )[0].outputs[0].text
 
 output
@@ -258,20 +299,19 @@ model.save_lora("grpo_saved_lora")
 """Now we load the LoRA and test:"""
 
 text = tokenizer.apply_chat_template([
-    {"role" : "system", "content" : SYSTEM_PROMPT},
-    {"role" : "user", "content" : "How many r's are in strawberry?"},
-], tokenize = False, add_generation_prompt = True)
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": "How many r's are in strawberry?"},
+], tokenize=False, add_generation_prompt=True)
 
-from vllm import SamplingParams
 sampling_params = SamplingParams(
-    temperature = 0.8,
-    top_p = 0.95,
-    max_tokens = 1024,
+    temperature=0.8,
+    top_p=0.95,
+    max_tokens=1024,
 )
 output = model.fast_generate(
     text,
-    sampling_params = sampling_params,
-    lora_request = model.load_lora("grpo_saved_lora"),
+    sampling_params=sampling_params,
+    lora_request=model.load_lora("grpo_saved_lora"),
 )[0].outputs[0].text
 
 output
@@ -285,16 +325,27 @@ We also support saving to `float16` directly. Select `merged_16bit` for float16 
 """
 
 # Merge to 16bit
-if False: model.save_pretrained_merged("model", tokenizer, save_method = "merged_16bit",)
-if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "merged_16bit", token = "")
+if False:
+    model.save_pretrained_merged(
+        "model", tokenizer, save_method="merged_16bit",)
+if False:
+    model.push_to_hub_merged("hf/model", tokenizer,
+                             save_method="merged_16bit", token="")
 
 # Merge to 4bit
-if False: model.save_pretrained_merged("model", tokenizer, save_method = "merged_4bit",)
-if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "merged_4bit", token = "")
+if False:
+    model.save_pretrained_merged(
+        "model", tokenizer, save_method="merged_4bit",)
+if False:
+    model.push_to_hub_merged("hf/model", tokenizer,
+                             save_method="merged_4bit", token="")
 
 # Just LoRA adapters
-if False: model.save_pretrained_merged("model", tokenizer, save_method = "lora",)
-if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "lora", token = "")
+if False:
+    model.save_pretrained_merged("model", tokenizer, save_method="lora",)
+if False:
+    model.push_to_hub_merged("hf/model", tokenizer,
+                             save_method="lora", token="")
 
 """### GGUF / llama.cpp Conversion
 To save to `GGUF` / `llama.cpp`, we support it natively now! We clone `llama.cpp` and we default save it to `q8_0`. We allow all methods like `q4_k_m`. Use `save_pretrained_gguf` for local saving and `push_to_hub_gguf` for uploading to HF.
@@ -308,26 +359,35 @@ Some supported quant methods (full list on our [Wiki page](https://github.com/un
 """
 
 # Save to 8bit Q8_0
-if False: model.save_pretrained_gguf("model", tokenizer,)
+if False:
+    model.save_pretrained_gguf("model", tokenizer,)
 # Remember to go to https://huggingface.co/settings/tokens for a token!
 # And change hf to your username!
-if False: model.push_to_hub_gguf("hf/model", tokenizer, token = "")
+if False:
+    model.push_to_hub_gguf("hf/model", tokenizer, token="")
 
 # Save to 16bit GGUF
-if False: model.save_pretrained_gguf("model", tokenizer, quantization_method = "f16")
-if False: model.push_to_hub_gguf("hf/model", tokenizer, quantization_method = "f16", token = "")
+if False:
+    model.save_pretrained_gguf("model", tokenizer, quantization_method="f16")
+if False:
+    model.push_to_hub_gguf("hf/model", tokenizer,
+                           quantization_method="f16", token="")
 
 # Save to q4_k_m GGUF
-if False: model.save_pretrained_gguf("model", tokenizer, quantization_method = "q4_k_m")
-if False: model.push_to_hub_gguf("hf/model", tokenizer, quantization_method = "q4_k_m", token = "")
+if False:
+    model.save_pretrained_gguf(
+        "model", tokenizer, quantization_method="q4_k_m")
+if False:
+    model.push_to_hub_gguf("hf/model", tokenizer,
+                           quantization_method="q4_k_m", token="")
 
 # Save to multiple GGUF options - much faster if you want multiple!
 if False:
     model.push_to_hub_gguf(
-        "hf/model", # Change hf to your username!
+        "hf/model",  # Change hf to your username!
         tokenizer,
-        quantization_method = ["q4_k_m", "q8_0", "q5_k_m",],
-        token = "",
+        quantization_method=["q4_k_m", "q8_0", "q5_k_m",],
+        token="",
     )
 
 """Now, use the `model-unsloth.gguf` file or `model-unsloth-Q4_K_M.gguf` file in llama.cpp or a UI based system like Jan or Open WebUI. You can install Jan [here](https://github.com/janhq/jan) and Open WebUI [here](https://github.com/open-webui/open-webui)
