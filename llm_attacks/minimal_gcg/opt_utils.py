@@ -94,20 +94,35 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
 
 
 def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None):
-    cands, count = [], 0
+    cands = []
+    target_length = len(control_cand[0])  # Length we want to maintain
+
     for i in range(control_cand.shape[0]):
         decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
-        if filter_cand:
-            if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
-                cands.append(decoded_str)
-            else:
-                count += 1
-        else:
-            cands.append(decoded_str)
+        encoded_ids = tokenizer(decoded_str, add_special_tokens=False).input_ids
 
-    if filter_cand:
-        cands = cands + [cands[-1]] * (len(control_cand) - len(cands))
-        # print(f"Warning: {round(count / len(control_cand), 2)} control candidates were not valid")
+        # If too long, truncate
+        if len(encoded_ids) > target_length:
+            truncated_str = tokenizer.decode(encoded_ids[:target_length], skip_special_tokens=True)
+            encoded_ids = tokenizer(truncated_str, add_special_tokens=False).input_ids
+
+        # If too short, pad with "!"
+        if len(encoded_ids) < target_length:
+            padding_needed = target_length - len(encoded_ids)
+            decoded_str = decoded_str + " " + "!" * padding_needed
+            encoded_ids = tokenizer(decoded_str, add_special_tokens=False).input_ids
+
+        # Verify length is correct after modification
+        if len(encoded_ids) == target_length:
+            cands.append(decoded_str)
+        else:
+            # Fallback to current control if we still can't get correct length
+            cands.append(curr_control)
+
+    # Ensure we have enough candidates
+    while len(cands) < len(control_cand):
+        cands.append(cands[0])
+    print(len(cands))
     return cands
 
 
