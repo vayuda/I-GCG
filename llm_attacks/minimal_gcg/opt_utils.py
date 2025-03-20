@@ -7,6 +7,73 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llm_attacks import get_embedding_matrix, get_embeddings
 
+class UCBTracker:
+    def __init__(self, device):
+        self.token_counts = {}  # (position, token_id) -> count
+        self.total_pulls = 1
+        self.device = device
+
+    def get_count(self, position, token_id):
+        return self.token_counts.get((position.item(), token_id.item()), 1)
+
+    def update_count(self, position, token_id):
+        key = (position.item(), token_id.item())
+        self.token_counts[key] = self.token_counts.get(key, 1) + 1
+
+
+def sample_control_ucb(control_toks, grad, batch_size, topk=256, not_allowed_tokens=None, ucb_tracker=None):
+    """
+    Sample control tokens using UCB strategy
+    UCB = Q(a) + c * sqrt(ln(t)/N(a))
+    """
+    if ucb_tracker is None:
+        ucb_tracker = UCBTracker(grad.device)
+
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+
+    # Calculate UCB scores for each position
+    c = 2.0  # exploration coefficient
+    ucb_scores = torch.zeros_like(grad)
+
+    # Calculate UCB scores for each position
+    for pos in range(grad.shape[0]):
+        exploitation_term = -grad[pos]  # negative gradient as immediate reward
+
+        # Calculate exploration terms using stored counts
+        counts = torch.tensor([ucb_tracker.get_count(torch.tensor(pos), torch.tensor(token_id))
+                             for token_id in range(grad.shape[1])],
+                             device=grad.device)
+
+        exploration_term = c * torch.sqrt(
+            torch.log(torch.tensor(ucb_tracker.total_pulls, device=grad.device)) / counts
+        )
+        ucb_scores[pos] = exploitation_term + exploration_term
+
+    # Get top k indices based on UCB scores
+    top_indices = ucb_scores.topk(topk, dim=1).indices
+    control_toks = control_toks.to(grad.device)
+
+    original_control_toks = control_toks.repeat(batch_size, 1)
+    new_token_pos = torch.arange(
+        0,
+        len(control_toks),
+        len(control_toks) / batch_size,
+        device=grad.device
+    ).type(torch.int64)
+
+    # Select tokens with highest UCB scores
+    new_token_val = top_indices[new_token_pos, 0].unsqueeze(-1)
+
+    # Update counts for selected tokens
+    for pos, token in zip(new_token_pos, new_token_val):
+        ucb_tracker.update_count(pos, token)
+    ucb_tracker.total_pulls += 1
+
+    # Create new candidates
+    new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
+
+    return new_control_toks
 
 def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
 
@@ -44,27 +111,28 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
         input_ids[input_slice].unsqueeze(1),
         torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
     )
-    one_hot.requires_grad_()
-    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
+    with torch.enable_grad():
+        one_hot.requires_grad_()
+        input_embeds = (one_hot @ embed_weights).unsqueeze(0)
 
-    # now stitch it together with the rest of the embeddings
-    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
-    full_embeds = torch.cat(
-        [
-            embeds[:,:input_slice.start,:],
-            input_embeds,
-            embeds[:,input_slice.stop:,:]
-        ],
-        dim=1)
+        # now stitch it together with the rest of the embeddings
+        embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+        full_embeds = torch.cat(
+            [
+                embeds[:,:input_slice.start,:],
+                input_embeds,
+                embeds[:,input_slice.stop:,:]
+            ],
+            dim=1)
 
-    logits = model(inputs_embeds=full_embeds).logits
-    targets = input_ids[target_slice]
-    loss = nn.CrossEntropyLoss()(logits[0,loss_slice,:], targets)
+        logits = model(inputs_embeds=full_embeds).logits
+        targets = input_ids[target_slice]
+        loss = nn.CrossEntropyLoss()(logits[0,loss_slice,:], targets)
 
-    loss.backward()
+        loss.backward()
 
-    grad = one_hot.grad.clone()
-    grad = grad / grad.norm(dim=-1, keepdim=True)
+        grad = one_hot.grad.clone()
+        grad = grad / grad.norm(dim=-1, keepdim=True)
 
     return grad
 
@@ -122,7 +190,6 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
     # Ensure we have enough candidates
     while len(cands) < len(control_cand):
         cands.append(cands[0])
-    print(len(cands))
     return cands
 
 
@@ -202,6 +269,7 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
             model_path,
             torch_dtype=torch.float16,
             trust_remote_code=True,
+            attn_implementation="flash_attention_2",
             **kwargs
         ).to(device).eval()
 

@@ -1,0 +1,31 @@
+nohup: ignoring input
+You are attempting to use Flash Attention 2.0 with a model not initialized on GPU. Make sure to move the model to GPU after initializing it on CPU with `model.to('cuda')`.
+behavior_config: behaviors_ours_config.json
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  1.21it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.49it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.44it/s]
+Traceback (most recent call last):
+  File "/home/pawan/code-bases/llmsec/I-GCG/attack_llm_core_best_update_our_target.py", line 122, in <module>
+    model, tokenizer = load_model_and_tokenizer(model_path,
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pawan/code-bases/llmsec/I-GCG/llm_attacks/minimal_gcg/opt_utils.py", line 274, in load_model_and_tokenizer
+    ).to(device).eval()
+      ^^^^^^^^^^
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/transformers/modeling_utils.py", line 3157, in to
+    return super().to(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1343, in to
+    return self._apply(convert)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/torch/nn/modules/module.py", line 903, in _apply
+    module._apply(fn)
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/torch/nn/modules/module.py", line 903, in _apply
+    module._apply(fn)
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/torch/nn/modules/module.py", line 903, in _apply
+    module._apply(fn)
+  [Previous line repeated 2 more times]
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/torch/nn/modules/module.py", line 930, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/home/pawan/miniconda3/envs/ml/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1329, in convert
+    return t.to(
+           ^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 44.00 MiB. GPU 0 has a total capacity of 44.52 GiB of which 11.00 MiB is free. Process 3993953 has 2.28 GiB memory in use. Process 3769565 has 38.10 GiB memory in use. Including non-PyTorch memory, this process has 4.11 GiB memory in use. Of the allocated memory 3.61 GiB is allocated by PyTorch, and 85.73 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
